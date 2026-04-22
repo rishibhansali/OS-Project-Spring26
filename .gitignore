@@ -1,0 +1,8 @@
+crawler
+indexer
+query
+data/
+*.o
+*.bin
+*.tsv
+/tmp/
