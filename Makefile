@@ -61,9 +61,9 @@ INDEXER_SRCS = $(SRC_IDX)/main.c       \
 QUERY_SRCS   = $(SRC_QRY)/main.c         \
                $(SRC_QRY)/index_reader.c
 
-.PHONY: all clean dirs run help
+.PHONY: all clean dirs run help cpp_crawler cpp_indexer cpp_query run_cpp
 
-all: dirs crawler indexer query
+all: dirs crawler indexer query cpp_crawler cpp_indexer cpp_query
 
 dirs:
 	@mkdir -p $(BUILD) data/pages index
@@ -85,6 +85,7 @@ query: $(QUERY_SRCS) $(SRC_QRY)/index_reader.h
 
 clean:
 	rm -rf $(BUILD)/ data/ index/
+	rm -f crawler indexer query
 	@echo "Cleaned."
 
 # End-to-end demo run:
@@ -104,9 +105,62 @@ run: all
 	$(BUILD)/query --index . web example domain
 
 help:
-	@echo "Targets: all  clean  run  help"
+	@echo "Targets: all  clean  run  run_cpp  help"
 	@echo ""
-	@echo "Usage after build:"
+	@echo "C binaries (build/):"
 	@echo "  $(BUILD)/indexer --ipc /tmp/crawl.sock --out <dir>"
 	@echo "  $(BUILD)/crawler --seed <url> --max-depth <D> --max-pages <N> -t <T> --out <dir> --ipc /tmp/crawl.sock"
 	@echo "  $(BUILD)/query   --index <dir> <term1> [term2 ...]"
+	@echo ""
+	@echo "C++ binaries (project root):"
+	@echo "  ./indexer --ipc /tmp/crawl.sock --out data/index"
+	@echo "  ./crawler --seed <url> --max-depth <D> --max-pages <N> -t <T> --out data --ipc /tmp/crawl.sock"
+	@echo "  ./query   --index data/index <term1> [term2 ...]"
+
+# =============================================================================
+# C++17 targets
+# Compiled separately from the C sources; produce binaries in the project root.
+# Uses g++ -std=c++17 -Wall -pthread and links libcurl.
+# =============================================================================
+
+CXX      = g++
+CXXFLAGS = -std=c++17 -Wall -pthread -O2
+
+# Detect libcurl for C++ build the same way as for C
+ifneq ($(strip $(PKGCFG_LIBS)),)
+  CXXLIBS = $(PKGCFG_LIBS)
+else ifneq ($(wildcard $(BREW_CURL)/lib/libcurl.dylib $(BREW_CURL)/lib/libcurl.a),)
+  CXXLIBS = -L$(BREW_CURL)/lib -lcurl
+else
+  CXXLIBS = -lcurl
+endif
+
+cpp_indexer: indexer.cpp
+	$(CXX) $(CXXFLAGS) -o indexer indexer.cpp
+	@echo "Built: ./indexer (C++)"
+
+cpp_crawler: crawler.cpp
+	$(CXX) $(CXXFLAGS) -o crawler crawler.cpp $(CXXLIBS)
+	@echo "Built: ./crawler (C++)"
+
+cpp_query: query.cpp
+	$(CXX) $(CXXFLAGS) -o query query.cpp
+	@echo "Built: ./query (C++)"
+
+# End-to-end demo using the C++ binaries:
+#   1. Start indexer in background (listens on UNIX socket)
+#   2. Wait 1 second for indexer to be ready
+#   3. Run crawler (fetches up to 50 pages, 4 threads, depth 2)
+#   4. Crawler closes socket → indexer flushes → indexer exits
+#   5. Query the resulting index
+run_cpp: cpp_indexer cpp_crawler cpp_query
+	@mkdir -p data/index data/pages
+	@echo "=== Starting C++ indexer in background ==="
+	./indexer --ipc /tmp/crawl.sock --out data/index &
+	@sleep 1
+	@echo "=== Starting C++ crawler ==="
+	./crawler --seed https://en.wikipedia.org/wiki/Linux \
+	    --max-depth 2 --max-pages 50 -t 4 \
+	    --out data --ipc /tmp/crawl.sock
+	@echo "=== Querying index ==="
+	./query --index data/index operating systems threads
