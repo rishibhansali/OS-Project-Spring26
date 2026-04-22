@@ -1,248 +1,204 @@
 # Multithreaded Web Crawler Pipeline
 
-A concurrent web crawler (C11, pthreads, libcurl, libxml2) that crawls URLs in parallel, feeds fetched pages through a UNIX socket IPC pipeline to an indexer process, and builds a persistent on-disk inverted index queryable via a command-line tool.
+A concurrent web crawler implemented in two separate stacks:
+
+- **C11 version** (`src/`) — uses pthreads, libcurl, libxml2, binary IPC protocol
+- **C++17 version** (project root) — uses `std::thread`, `std::mutex`, `std::condition_variable`, STL containers, libcurl, text IPC protocol
+
+Both versions crawl URLs in parallel, stream fetched-page metadata to an indexer over a UNIX domain socket, and build a persistent on-disk inverted index queryable via a command-line tool.
 
 ---
 
 ## Project Structure
 
 ```
-webcrawler/
-├── Makefile
-├── README.md
+├── Makefile              builds both C and C++ versions
+├── crawler.cpp           C++17 multithreaded crawler
+├── indexer.cpp           C++17 inverted-index builder
+├── query.cpp             C++17 AND query tool
 ├── src/
 │   ├── common/
-│   │   └── ipc_proto.h          shared IPC wire protocol
-│   ├── crawler/
-│   │   ├── main.c               CLI, thread pool, shutdown, summary
-│   │   ├── queue.h/queue.c      bounded thread-safe URL frontier
-│   │   ├── visited.h/visited.c  thread-safe hash set (check+insert)
-│   │   ├── fetch.h/fetch.c      libcurl HTTP GET, per-thread handle
-│   │   ├── parse.h/parse.c      libxml2 link extraction + URL normalize
-│   │   └── ipc_client.h/ipc_client.c  UNIX socket sender
-│   ├── indexer/
-│   │   ├── main.c               CLI, IPC recv loop, flush on sentinel
-│   │   ├── ipc_server.h/ipc_server.c  UNIX socket server
-│   │   ├── tokenizer.h/tokenizer.c    HTML tag-strip + word tokenize
-│   │   └── index.h/index.c      in-memory inverted index + disk flush
-│   └── query/
-│       ├── main.c               CLI, load index, AND intersect, print
-│       └── index_reader.h/index_reader.c  dict/postings/docs readers
+│   │   └── ipc_proto.h   shared binary IPC wire protocol (C)
+│   ├── crawler/          C11 crawler sources
+│   ├── indexer/          C11 indexer sources
+│   └── query/            C11 query sources
+├── build/                compiled C binaries (build/crawler, etc.)
 ├── data/
-│   └── pages/                   HTML files saved by crawler (<docid>.html)
-└── index/
-    ├── docs.tsv                 document map
-    ├── dict.tsv                 term dictionary
-    └── postings.bin             postings lists (binary)
+│   └── pages/            HTML files saved by crawler (<docid>.html)
+└── index/                on-disk index (docs.tsv, dict.tsv, postings.bin)
 ```
 
 ---
 
-## Build Requirements
+## Build
 
-- macOS (Apple Clang / clang with C11 support)
-- [Homebrew](https://brew.sh) for dependencies
-
-### Install dependencies
+### Install dependencies (macOS)
 
 ```bash
 brew install pkg-config curl libxml2
 ```
 
-### Build
+### Build all (C and C++ versions)
 
 ```bash
 make all
 ```
 
-This produces `build/crawler`, `build/indexer`, and `build/query`.
+Produces:
+- `build/crawler`, `build/indexer`, `build/query`  (C11)
+- `./crawler`, `./indexer`, `./query`               (C++17)
+
+### Build only C++ version
+
+```bash
+make cpp_crawler cpp_indexer cpp_query
+```
 
 ### Clean
 
 ```bash
-make clean    # removes build/, data/, index/
+make clean
 ```
 
 ---
 
-## Usage
+## Running the C++ version
 
-### Step 1 — Start the indexer (it must be running before the crawler)
+### Step 1 — Start the indexer (must run before the crawler connects)
 
 ```bash
-./build/indexer --ipc /tmp/crawl.sock --out .
+./indexer --ipc /tmp/crawl.sock --out data/index
 ```
 
-The indexer listens on the UNIX socket and waits for the crawler to connect.
+The indexer binds a UNIX socket and blocks in `accept()` waiting for the crawler.
 
 ### Step 2 — Run the crawler
 
 ```bash
-./build/crawler \
+./crawler \
     --seed https://en.wikipedia.org/wiki/Linux \
     --max-depth 2 \
-    --max-pages 100 \
-    -t 8 \
-    --out . \
+    --max-pages 50 \
+    -t 4 \
+    --out data \
     --ipc /tmp/crawl.sock
 ```
 
-When the crawler finishes (page limit or frontier exhaustion), it sends a sentinel to the indexer. The indexer then flushes the index to disk and exits.
+When the crawler finishes it closes the socket. The indexer sees EOF, flushes to disk, and exits.
 
 ### Step 3 — Query the index
 
 ```bash
-./build/query --index . operating systems threads
-./build/query --index . linux kernel
-./build/query --index . thistermdoesnotexist
+./query --index data/index operating systems
+./query --index data/index linux kernel threads
+./query --index data/index termthatdoesnotexist
 ```
 
 **Sample output:**
 ```
 Found 3 matching documents (AND across terms):
-  42  https://en.wikipedia.org/wiki/Operating_system
-  87  https://en.wikipedia.org/wiki/Thread_(computing)
-  105 https://en.wikipedia.org/wiki/POSIX_Threads
+  0  https://en.wikipedia.org/wiki/Linux
+  12 https://en.wikipedia.org/wiki/Operating_system
+  31 https://en.wikipedia.org/wiki/POSIX_Threads
 ```
 
-```
-No documents matched all query terms.
-```
-
-### Makefile `run` target (automated demo)
+### Automated demo (Makefile target)
 
 ```bash
-make run    # crawls https://example.com depth=2 pages=50 threads=4
-```
-
-### Help
-
-```bash
-./build/crawler -h
-./build/indexer -h
-./build/query   -h
+make run_cpp
 ```
 
 ---
 
 ## CLI Reference
 
-```
-crawler --seed <url> --max-depth <D> --max-pages <N> -t <threads> --out <dir> --ipc <path>
-indexer --ipc <path> --out <dir>
-query   --index <dir> <term1> [term2 ...]
-```
-
-| Flag | Description |
-|---|---|
-| `--seed` | Seed URL (required for crawler) |
-| `--max-depth` | Max link-follow depth; 0 = only the seed page |
-| `--max-pages` | Stop after this many successful fetches |
-| `-t` | Number of worker threads in the pool |
-| `--out` | Root output directory; `data/pages/` and `index/` live inside |
-| `--ipc` | UNIX domain socket path; must match between crawler and indexer |
-| `--index` | Directory containing `index/` subdirectory (for query) |
+| Binary   | Flags                                                                 |
+|----------|-----------------------------------------------------------------------|
+| indexer  | `--ipc <path>` `--out <dir>`                                         |
+| crawler  | `--seed <url>` `--max-depth <D>` `--max-pages <N>` `-t <T>` `--out <dir>` `--ipc <path>` |
+| query    | `--index <dir>` `<term1>` `[term2 ...]`                              |
 
 ---
 
 ## Design Details
 
-### URL Queue (Bounded Frontier)
+### Bounded URL Queue (crawler.cpp)
 
-Implemented in `src/crawler/queue.c` as a circular ring buffer protected by `pthread_mutex_t` and two `pthread_cond_t` variables (`not_full`, `not_empty`).
+The URL frontier is a `std::queue<UrlEntry>` wrapped by a `std::mutex` and **two `std::condition_variable`s**:
 
-- **Backpressure**: Producer (`url_queue_push`) blocks via `pthread_cond_wait` when the queue is full.
-- **Consumer blocking**: Worker threads block in `url_queue_pop` when the queue is empty.
-- **Shutdown**: `url_queue_shutdown()` sets a flag and broadcasts both condition variables, waking all blocked threads. Push returns `-1` (caller must free URL); pop returns `-1` when shutdown and empty.
-- **High-water mark** tracked for summary statistics.
+- **`not_empty`** — worker threads (consumers) wait here when the queue is empty. `push()` calls `notify_one()` after adding a URL to wake one waiting consumer.
+- **`not_full`** — worker threads (producers pushing extracted links) wait here when the queue is at capacity (capped at 1000). `pop()` calls `notify_one()` after removing a URL to wake one waiting producer. This provides **backpressure**: if fetching outpaces consumption the producers slow down instead of growing memory unbounded.
 
-### Visited Set
+`shutdown()` sets a `done` flag and calls `notify_all()` on both CVs, so every blocked thread wakes up and returns `false` to exit its loop cleanly.
 
-Implemented in `src/crawler/visited.c` as an open-addressing hash table (power-of-2 capacity, FNV-1a hash, linear probing) protected by a single `pthread_mutex_t`.
+### Visited Set (crawler.cpp)
 
-- `visited_check_and_insert()` is **atomic**: under the mutex it checks for the URL and inserts it in one operation, preventing any race between the check and the insert.
-- Automatic resize at 70% load factor (capacity doubles, entries rehashed).
+`VisitedSet` wraps `std::unordered_set<std::string>` with a single `std::mutex`.
 
-### Thread Pool
+`check_and_insert()` is **atomic**: the lookup and the insert are both done under the same lock. This prevents two threads from both seeing a URL as "new" at the same moment and crawling it twice.
 
-Fixed-size pool of N `pthread` worker threads, all sharing:
-- The URL queue (blocking pop)
+### Thread Pool (crawler.cpp)
+
+A fixed pool of `N` `std::thread` workers all share:
+- The bounded URL queue (blocking pop)
 - The visited set (atomic check+insert)
 - The IPC client (mutex-serialized sends)
-- Atomic counters: `pages_fetched`, `pages_failed`, `pages_skipped`, `next_docid`
+- `std::atomic<int>` counters: `pages_fetched`, `pages_failed`, `pages_skipped`, `next_docid`
 
-No thread-per-URL. Each thread loops (pop → fetch → save → IPC send → parse → enqueue). Threads exit when `url_queue_pop` returns `-1` (shutdown + empty).
+Each worker loops: **pop → fetch (libcurl) → save HTML → IPC send → extract links → push new URLs**.
 
-### Stop Conditions (Race-Free)
+### Stop Conditions (crawler.cpp)
 
-- `_Atomic int pages_fetched` is incremented with `atomic_fetch_add`.
-- Worker checks `atomic_load(&ctx->pages_fetched) >= ctx->max_pages` before fetching.
-- The first worker to exceed the limit sets `ctx->shutdown = 1` and calls `url_queue_shutdown()`, which broadcasts to all waiting threads.
-- `url_queue_shutdown()` is idempotent: calling it multiple times is safe.
+Two conditions trigger `queue.shutdown()`, which wakes all blocked workers:
 
-### IPC Protocol
+1. **Page limit**: `pages_fetched >= max_pages` checked before each fetch.
+2. **Frontier exhaustion**: `active_workers == 0 && queue.size() == 0`. The `active_workers` atomic is incremented after a successful pop and decremented at the end of each iteration. When it reaches 0 with an empty queue, no thread is doing anything and no new URLs will arrive — crawl is done.
 
-UNIX domain socket (`AF_UNIX`, `SOCK_STREAM`) at the path given by `--ipc`.
+### IPC Protocol (text, between C++ crawler and C++ indexer)
 
-**Wire format** (defined in `src/common/ipc_proto.h`):
+Transport: UNIX domain socket (`AF_UNIX`, `SOCK_STREAM`).
 
+Each message is a **newline-terminated text line**:
 ```
-[ipc_msg_header_t: 10 bytes, packed]
-  uint32_t docid
-  uint16_t depth
-  uint16_t url_len
-  uint16_t path_len
-[url_len bytes of URL (no null terminator)]
-[path_len bytes of filepath (no null terminator)]
+docid url filepath depth\n
 ```
 
-**Sentinel**: header with `docid = UINT32_MAX`, all lengths = 0, no body. Signals end-of-crawl to indexer.
+Example:
+```
+42 https://en.wikipedia.org/wiki/Linux data/pages/42.html 1
+```
 
-All multi-byte fields are in host byte order (both processes run on the same machine).
+The crawler closes the socket when done; the indexer detects EOF and flushes.
 
-The IPC client uses an internal `pthread_mutex_t` to serialize concurrent sends from multiple worker threads.
+The IPC client has an internal `std::mutex` so concurrent worker threads never interleave their messages.
 
 ### On-Disk Index Format
 
-All files live inside `<out_dir>/index/`.
+All three files live in the directory given to `./indexer --out <dir>`.
 
 | File | Format | Description |
 |---|---|---|
 | `docs.tsv` | `docid\turl\tfilepath\tdepth\n` | Document map |
-| `dict.tsv` | `term\toffset\tdf\n` | Dictionary: term → byte offset in postings.bin + doc frequency |
-| `postings.bin` | `[uint32 count][uint32 docid × count]` per term | Binary postings lists, sorted ascending |
+| `dict.tsv` | `term\toffset\tdf\n` | Term → byte offset in postings.bin + document frequency |
+| `postings.bin` | `[uint32_t count][uint32_t docid × count]` per term | Binary postings lists (sorted ascending) |
 
-`offset` in `dict.tsv` is a `uint64_t` byte offset into `postings.bin` written as a decimal integer.
+`offset` in `dict.tsv` is the byte position in `postings.bin` where that term's block starts. The query tool uses `fseek()` to jump directly to it without scanning the whole file.
 
-The index supports **append/merge across runs**: on startup the indexer loads any existing index into memory, merges new documents, and rewrites all three files on flush.
+### Tokenization (indexer.cpp)
 
-### Tokenization
+1. Strip HTML tags: simple state machine, skips everything between `<` and `>`.
+2. Split on any non-alphabetic character.
+3. Lowercase each token; discard tokens shorter than 2 characters.
 
-1. Strip HTML tags: simple state machine skipping `<...>` content; entire `<script>` and `<style>` element bodies are discarded.
-2. Decode common HTML entities (`&amp;`, `&lt;`, `&gt;`, `&nbsp;`, `&quot;`).
-3. Split on whitespace + punctuation via `strtok_r`.
-4. Lowercase each token; discard tokens shorter than 2 or longer than 128 characters.
-5. Filter ~90 common English stopwords (sorted array + `bsearch`).
+### AND Intersection (query.cpp)
+
+Loads postings lists for all query terms, then intersects them pairwise using a linear merge (both lists are already sorted). Result is the set of docids present in **all** lists.
 
 ---
 
 ## macOS Notes
 
-- Uses `clang` explicitly (avoids `gcc` → Apple Clang alias ambiguity).
-- Makefile auto-detects Homebrew keg-only libxml2 via `brew --prefix`.
-- Uses `pthread_mutex_t + pthread_cond_t` throughout (avoids deprecated `sem_init`).
-- UNIX socket path limited to 103 characters (`sockaddr_un.sun_path` is 104 bytes on macOS).
-- `clock_gettime(CLOCK_MONOTONIC)` used for runtime measurement (available since macOS 10.12).
-
----
-
-## Summary Statistics (printed by crawler on exit)
-
-```
-=== Crawler Summary ===
-Pages fetched:   N
-Pages failed:    N
-Pages skipped:   N
-Max queue depth: N
-Total runtime:   X.XXs
-```
+- C build uses `clang` with `-std=c11`; C++ build uses `g++` with `-std=c++17`
+- Makefile auto-detects libcurl via `pkg-config` then Homebrew keg-only, falling back to the macOS system SDK
+- UNIX socket path is limited to 103 characters on macOS
+- `std::chrono::steady_clock` used for runtime measurement (monotonic, not wall-clock)
