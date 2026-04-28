@@ -51,38 +51,32 @@ struct UrlEntry {
 // -------------------------------------------------------------------------
 // Bounded thread-safe URL queue
 //
-// This wraps std::queue with a mutex and two condition variables:
+// push() is non-blocking: if the queue is at capacity, the URL is dropped.
+// Blocking in push() while active_workers > 0 would deadlock the crawler —
+// all threads would wait for space that no one frees because no one calls pop().
 //
-//   not_empty — consumers (worker threads) wait here when the queue is empty.
-//               Signaled by push() when a new URL is added.
+// not_empty — consumers wait here when the queue is empty.
+//             Signaled by push() when a new URL is added.
 //
-//   not_full  — producers (worker threads pushing newly found links) wait
-//               here when the queue is at capacity.  Provides backpressure:
-//               if crawling is very fast the queue fills up and extra link
-//               extraction blocks until workers consume some entries.
-//               Signaled by pop() when a slot is freed.
-//
-// shutdown() sets a flag and broadcasts both CVs so every blocked caller
-// wakes up and sees the done flag, returning false to exit cleanly.
+// shutdown() sets done and broadcasts not_empty so blocked consumers exit.
 // -------------------------------------------------------------------------
 struct BoundedQueue {
     std::queue<UrlEntry>    q;
     std::mutex              mtx;
     std::condition_variable not_empty;  // wait here when queue is empty
-    std::condition_variable not_full;   // wait here when queue is full
     int                     cap;
     bool                    done;
 
     explicit BoundedQueue(int capacity) : cap(capacity), done(false) {}
 
-    // push: blocks if queue is at cap; returns false if shutdown was called
+    // push: non-blocking. Returns false if shutdown or queue is full (URL dropped).
+    // Blocking here while workers hold active_workers > 0 causes a deadlock:
+    // all threads can end up waiting for not_full with no one left to call pop().
     bool push(const std::string &url, int depth) {
-        std::unique_lock<std::mutex> lk(mtx);
-        // Block while full unless shutting down (done avoids deadlock)
-        not_full.wait(lk, [&]{ return (int)q.size() < cap || done; });
-        if (done) return false;
+        std::lock_guard<std::mutex> lk(mtx);
+        if (done || (int)q.size() >= cap) return false;
         q.push({url, depth});
-        not_empty.notify_one();  // wake one waiting consumer
+        not_empty.notify_one();
         return true;
     }
 
@@ -94,7 +88,6 @@ struct BoundedQueue {
         if (q.empty()) return false;   // shutdown + empty = no more work
         out = std::move(q.front());
         q.pop();
-        not_full.notify_one();  // wake one waiting producer
         return true;
     }
 
@@ -103,7 +96,6 @@ struct BoundedQueue {
         std::lock_guard<std::mutex> lk(mtx);
         done = true;
         not_empty.notify_all();
-        not_full.notify_all();
     }
 
     int size() {
