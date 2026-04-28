@@ -61,7 +61,7 @@ INDEXER_SRCS = $(SRC_IDX)/main.c       \
 QUERY_SRCS   = $(SRC_QRY)/main.c         \
                $(SRC_QRY)/index_reader.c
 
-.PHONY: all clean dirs run help cpp_crawler cpp_indexer cpp_query run_cpp
+.PHONY: all clean dirs run help crawler indexer query cpp_crawler cpp_indexer cpp_query run_cpp
 
 all: dirs crawler indexer query cpp_crawler cpp_indexer cpp_query
 
@@ -98,11 +98,11 @@ run: all
 	$(BUILD)/indexer --ipc /tmp/webcrawler.sock --out . &
 	@sleep 0.5
 	@echo "=== Starting crawler ==="
-	$(BUILD)/crawler --seed https://example.com --max-depth 2 \
+	$(BUILD)/crawler --seed https://en.wikipedia.org/wiki/Linux --max-depth 2 \
 	    --max-pages 50 -t 4 --out . --ipc /tmp/webcrawler.sock
 	@sleep 1
 	@echo "=== Querying index ==="
-	$(BUILD)/query --index . web example domain
+	$(BUILD)/query --index . linux kernel operating
 
 help:
 	@echo "Targets: all  clean  run  run_cpp  help"
