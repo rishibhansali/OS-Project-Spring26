@@ -1,6 +1,6 @@
-crawler
-indexer
-query
+/crawler
+/indexer
+/query
 data/
 *.o
 *.bin
